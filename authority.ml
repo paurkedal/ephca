@@ -83,6 +83,7 @@ module Make (Pclock : Mirage_clock.PCLOCK) = struct
   let own_cert ca = ca.own_cert
 
   let sign ~csr ?(subject_spec = `Serial) ca =
+    let adopt_san = Key_gen.adopt_san () in
     let valid_from = Pclock.now_d_ps () |> Ptime.v in
     let/? valid_until =
       Ptime.add_span valid_from cert_lifetime
@@ -100,10 +101,18 @@ module Make (Pclock : Mirage_clock.PCLOCK) = struct
     in
     let extensions =
       let open X509.Extension in
-      let key_id = X509.Public_key.id CSR.((info csr).public_key) in
+      let csr_info = CSR.info csr in
+      let key_id = X509.Public_key.id csr_info.CSR.public_key in
       let authority_key_id =
         let id = X509.Public_key.id (X509.Certificate.public_key ca.own_cert) in
         (Some id, directory_name cacert_dn, Some cacert_serial_number)
+      in
+      let san =
+        if not adopt_san then None else
+        (match CSR.Ext.find CSR.Ext.Extensions csr_info.CSR.extensions with
+         | None -> None
+         | Some exts ->
+            X509.Extension.find X509.Extension.Subject_alt_name exts)
       in
       empty
         |> add Basic_constraints (false, (false, None))
@@ -111,6 +120,7 @@ module Make (Pclock : Mirage_clock.PCLOCK) = struct
                 [`Digital_signature; `Content_commitment; `Key_encipherment])
         |> add Subject_key_id (false, key_id)
         |> add Authority_key_id (false, authority_key_id)
+        |> Option.fold ~none:Fun.id ~some:(add Subject_alt_name) san
     in
     Log.info (fun f ->
       f "Signing <%a>, valid %a/%a."
