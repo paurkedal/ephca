@@ -15,4 +15,4 @@ FROM alpine
 COPY --from=0 /home/opam/ephca/_installed_bin/ephca /usr/local/bin/ephca
 RUN apk --no-cache add gmp
 EXPOSE 80/tcp
-ENTRYPOINT /usr/local/bin/ephca
+ENTRYPOINT ["/usr/local/bin/ephca"]
