@@ -30,11 +30,9 @@ let directory_name dn = X509.General_name.(singleton Directory [dn])
 let prefix = DN.[cn "EphCA"]
 let cacert_dn = prefix @ DN.[cn "Ephemeral CA for Testing"]
 let cacert_bits = 4096
-let cacert_lifetime = Ptime.Span.v (1, 0L)
 let cacert_serial_number = Z.zero
 let cert_prefix_for_origin = DN.(prefix @ [ou "Apparent Origin"])
 let cert_prefix_for_serial_number = DN.(prefix @ [ou "Anonymous"])
-let cert_lifetime = Ptime.Span.v (1, 0L)
 
 let log_src = Logs.Src.create "authority"
 module Log = (val Logs.src_log log_src)
@@ -50,6 +48,7 @@ module Make (Pclock : Mirage_clock.PCLOCK) = struct
   }
 
   let create () =
+    let cacert_lifetime = Ptime.Span.of_int_s (Key_gen.cacert_lifetime ()) in
     let valid_from = Pclock.now_d_ps () |> Ptime.v in
     let/? valid_until =
       Ptime.add_span valid_from cacert_lifetime
@@ -83,6 +82,7 @@ module Make (Pclock : Mirage_clock.PCLOCK) = struct
   let own_cert ca = ca.own_cert
 
   let sign ~csr ?(subject_spec = `Serial) ca =
+    let cert_lifetime = Ptime.Span.of_int_s (Key_gen.cert_lifetime ()) in
     let adopt_san = Key_gen.adopt_san () in
     let valid_from = Pclock.now_d_ps () |> Ptime.v in
     let/? valid_until =

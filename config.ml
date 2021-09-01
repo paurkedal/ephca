@@ -15,12 +15,27 @@ let adopt_san =
   in
   Key.(create "adopt_san" Arg.(opt bool false doc))
 
+let cacert_lifetime =
+  let doc = "Lifetime of CA certificate in seconds." in
+  let arginfo = Key.Arg.info ~doc ["cacert-lifetime"] in
+  Key.(create "cacert_lifetime" Arg.(opt int 86400 arginfo))
+
+let cert_lifetime =
+  let doc = "Lifetime of issued certificates in seconds." in
+  let arginfo = Key.Arg.info ~doc ["cert-lifetime"] in
+  Key.(create "cert_lifetime" Arg.(opt int 86400 arginfo))
+
 let main =
   let packages = [
     package "mirage-crypto-rng" ~sublibs:["lwt"];
     package "uri";
   ] in
-  let keys = [Key.abstract http_port; Key.abstract adopt_san] in
+  let keys = [
+    Key.abstract http_port;
+    Key.abstract adopt_san;
+    Key.abstract cacert_lifetime;
+    Key.abstract cert_lifetime;
+  ] in
   foreign ~packages ~keys "Unikernel.Make"
   (pclock @-> http @-> job)
 
