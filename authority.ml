@@ -39,93 +39,100 @@ module Log = (val Logs.src_log log_src)
 
 let pp_ptime = Ptime.pp_rfc3339 ()
 
-module Make (Pclock : Mirage_clock.PCLOCK) = struct
 
-  type t = {
-    own_key: X509.Private_key.t;
-    own_cert: X509.Certificate.t;
-    mutable last_serial_number: Z.t;
+type t = {
+  cert_lifetime: Ptime.Span.t;
+  adopt_san: bool;
+  own_key: X509.Private_key.t;
+  own_cert: X509.Certificate.t;
+  mutable last_serial_number: Z.t;
+}
+
+let create ~cacert_lifetime ~cert_lifetime ~adopt_san () =
+  let valid_from = Mirage_ptime.now_d_ps () |> Ptime.v in
+  let/? valid_until =
+    Ptime.add_span valid_from cacert_lifetime
+      |> Option.to_result ~none:(`Msg "End time out of range.")
+  in
+  Log.info (fun f ->
+    f "Creating CA <%a> valid from %a to %a."
+      DN.pp cacert_dn pp_ptime valid_from pp_ptime valid_until);
+  let own_key = `RSA (Mirage_crypto_pk.Rsa.generate ~bits:cacert_bits ()) in
+  let/? ca_csr = CSR.create cacert_dn own_key in
+  let extensions =
+    let open X509.Extension in
+    let key_id = X509.Public_key.id CSR.((info ca_csr).public_key) in
+    let authority_key_id =
+      (Some key_id, directory_name cacert_dn,
+       Some (Z.to_string cacert_serial_number))
+    in
+    empty
+      |> add Basic_constraints (true, (true, None))
+      |> add Key_usage (true, [`Digital_signature; `Key_cert_sign; `CRL_sign])
+      |> add Subject_key_id (false, key_id)
+      |> add Authority_key_id (false, authority_key_id)
+  in
+  let/? own_cert =
+    CSR.sign
+        ~valid_from ~valid_until ~extensions
+        ~serial:(Z.to_string cacert_serial_number)
+      ca_csr own_key cacert_dn
+  in
+  Log.debug (fun f -> f "Created CA cert: %a" X509.Certificate.pp own_cert);
+  Ok {
+    cert_lifetime;
+    adopt_san;
+    own_key;
+    own_cert;
+    last_serial_number = cacert_serial_number;
   }
 
-  let create () =
-    let cacert_lifetime = Ptime.Span.of_int_s (Key_gen.cacert_lifetime ()) in
-    let valid_from = Pclock.now_d_ps () |> Ptime.v in
-    let/? valid_until =
-      Ptime.add_span valid_from cacert_lifetime
-        |> Option.to_result ~none:(`Msg "End time out of range.")
-    in
-    Log.info (fun f ->
-      f "Creating CA <%a> valid from %a to %a."
-        DN.pp cacert_dn pp_ptime valid_from pp_ptime valid_until);
-    let own_key = `RSA (Mirage_crypto_pk.Rsa.generate ~bits:cacert_bits ()) in
-    let/? ca_csr = CSR.create cacert_dn own_key in
-    let extensions =
-      let open X509.Extension in
-      let key_id = X509.Public_key.id CSR.((info ca_csr).public_key) in
-      let authority_key_id =
-        (Some key_id, directory_name cacert_dn, Some cacert_serial_number)
-      in
-      empty
-        |> add Basic_constraints (true, (true, None))
-        |> add Key_usage (true, [`Digital_signature; `Key_cert_sign; `CRL_sign])
-        |> add Subject_key_id (false, key_id)
-        |> add Authority_key_id (false, authority_key_id)
-    in
-    let/? own_cert =
-      CSR.sign ~valid_from ~valid_until ~extensions ~serial:cacert_serial_number
-        ca_csr own_key cacert_dn
-    in
-    Log.debug (fun f -> f "Created CA cert: %a" X509.Certificate.pp own_cert);
-    Ok {own_key; own_cert; last_serial_number = cacert_serial_number}
+let own_dn ca = X509.Certificate.subject ca.own_cert
+let own_cert ca = ca.own_cert
 
-  let own_dn ca = X509.Certificate.subject ca.own_cert
-  let own_cert ca = ca.own_cert
-
-  let sign ~csr ?(subject_spec = `Serial) ca =
-    let cert_lifetime = Ptime.Span.of_int_s (Key_gen.cert_lifetime ()) in
-    let adopt_san = Key_gen.adopt_san () in
-    let valid_from = Pclock.now_d_ps () |> Ptime.v in
-    let/? valid_until =
-      Ptime.add_span valid_from cert_lifetime
-        |> Option.to_result ~none:(`Msg "End time out of range.")
+let sign ~csr ?(subject_spec = `Serial) ca =
+  let valid_from = Mirage_ptime.now_d_ps () |> Ptime.v in
+  let/? valid_until =
+    Ptime.add_span valid_from ca.cert_lifetime
+      |> Option.to_result ~none:(`Msg "End time out of range.")
+  in
+  ca.last_serial_number <- Z.(ca.last_serial_number + one);
+  let serial = ca.last_serial_number in
+  let subject =
+    (match subject_spec with
+     | `Origin origin ->
+        DN.(cert_prefix_for_origin @ [cn origin])
+     | `Serial ->
+        let suffix = DN.[serialnumber (Z.to_string serial)] in
+        cert_prefix_for_serial_number @ suffix)
+  in
+  let extensions =
+    let open X509.Extension in
+    let csr_info = CSR.info csr in
+    let key_id = X509.Public_key.id csr_info.CSR.public_key in
+    let authority_key_id =
+      let id = X509.Public_key.id (X509.Certificate.public_key ca.own_cert) in
+      (Some id, directory_name cacert_dn,
+       Some (Z.to_string cacert_serial_number))
     in
-    ca.last_serial_number <- Z.(ca.last_serial_number + one);
-    let serial = ca.last_serial_number in
-    let subject =
-      (match subject_spec with
-       | `Origin origin ->
-          DN.(cert_prefix_for_origin @ [cn origin])
-       | `Serial ->
-          let suffix = DN.[serialnumber (Z.to_string serial)] in
-          cert_prefix_for_serial_number @ suffix)
+    let san =
+      if not ca.adopt_san then None else
+      (match CSR.Ext.find CSR.Ext.Extensions csr_info.CSR.extensions with
+       | None -> None
+       | Some exts ->
+          X509.Extension.find X509.Extension.Subject_alt_name exts)
     in
-    let extensions =
-      let open X509.Extension in
-      let csr_info = CSR.info csr in
-      let key_id = X509.Public_key.id csr_info.CSR.public_key in
-      let authority_key_id =
-        let id = X509.Public_key.id (X509.Certificate.public_key ca.own_cert) in
-        (Some id, directory_name cacert_dn, Some cacert_serial_number)
-      in
-      let san =
-        if not adopt_san then None else
-        (match CSR.Ext.find CSR.Ext.Extensions csr_info.CSR.extensions with
-         | None -> None
-         | Some exts ->
-            X509.Extension.find X509.Extension.Subject_alt_name exts)
-      in
-      empty
-        |> add Basic_constraints (false, (false, None))
-        |> add Key_usage (false,
-                [`Digital_signature; `Content_commitment; `Key_encipherment])
-        |> add Subject_key_id (false, key_id)
-        |> add Authority_key_id (false, authority_key_id)
-        |> Option.fold ~none:Fun.id ~some:(add Subject_alt_name) san
-    in
-    Log.info (fun f ->
-      f "Signing <%a>, valid %a/%a."
-        DN.pp subject pp_ptime valid_from pp_ptime valid_until);
-    CSR.sign ~valid_from ~valid_until ~extensions ~subject ~serial
-      csr ca.own_key (own_dn ca)
-
-end
+    empty
+      |> add Basic_constraints (false, (false, None))
+      |> add Key_usage (false,
+              [`Digital_signature; `Content_commitment; `Key_encipherment])
+      |> add Subject_key_id (false, key_id)
+      |> add Authority_key_id (false, authority_key_id)
+      |> Option.fold ~none:Fun.id ~some:(add Subject_alt_name) san
+  in
+  Log.info (fun f ->
+    f "Signing <%a>, valid %a/%a."
+      DN.pp subject pp_ptime valid_from pp_ptime valid_until);
+  CSR.sign
+    ~valid_from ~valid_until ~extensions ~subject ~serial:(Z.to_string serial)
+    csr ca.own_key (own_dn ca)

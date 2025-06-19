@@ -14,18 +14,17 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *)
 
-module Make :
-  functor (_ : Mirage_clock.PCLOCK) ->
-sig
-  type t
+type t
 
-  val create : unit -> (t, X509.Validation.signature_error) result
+val create :
+  cacert_lifetime: Ptime.Span.t ->
+  cert_lifetime: Ptime.Span.t ->
+  adopt_san: bool ->
+  unit -> (t, X509.Validation.signature_error) result
 
-  val own_cert : t -> X509.Certificate.t
+val own_cert : t -> X509.Certificate.t
 
-  val sign :
-    csr: X509.Signing_request.t ->
-    ?subject_spec: [`Serial | `Origin of string] ->
-    t -> (X509.Certificate.t, X509.Validation.signature_error) result
-
-end
+val sign :
+  csr: X509.Signing_request.t ->
+  ?subject_spec: [`Serial | `Origin of string] ->
+  t -> (X509.Certificate.t, X509.Validation.signature_error) result

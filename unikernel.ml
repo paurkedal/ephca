@@ -22,6 +22,30 @@ module type HTTP = Cohttp_mirage.Server.S
 let log_src = Logs.Src.create "http" ~doc:"HTTP server"
 module Log = (val Logs.src_log log_src)
 
+module Args = struct
+  open Cmdliner
+
+  let http_port' =
+    Arg.(value @@ opt int 80 @@ info ~doc:"Listening HTTP port." ["http-port"])
+
+  let adopt_san' =
+    let doc = "Adopt unvalidated SAN extensions from CSRs." in
+    Arg.(value @@ opt bool false @@ info ~doc ["adopt-san"])
+
+  let cacert_lifetime' =
+    let doc = "Lifetime of CA certificate in seconds." in
+    Arg.(value @@ opt int 86400 @@ info ~doc ["cacert-lifetime"])
+
+  let cert_lifetime' =
+    let doc = "Lifetime of issued certificates in seconds." in
+    Arg.(value @@ opt int 86400 @@ info ~doc ["cert-lifetime"])
+
+  let http_port = Mirage_runtime.register_arg http_port'
+  let adopt_san = Mirage_runtime.register_arg adopt_san'
+  let cacert_lifetime = Mirage_runtime.register_arg cacert_lifetime'
+  let cert_lifetime = Mirage_runtime.register_arg cert_lifetime'
+end
+
 let bad_request fmt = Fmt.kstr (fun s -> Error (`Bad_request s)) fmt
 
 let map_decode_error = Result.map_error @@ function
@@ -31,14 +55,17 @@ let map_signature_error = Result.map_error @@ fun err ->
   Fmt.kstr (fun s -> `Bad_request s) "%a"
     X509.Validation.pp_signature_error err
 
-module App (Pclock : Mirage_clock.PCLOCK) (S : HTTP) = struct
+module App (S : HTTP) = struct
 
-  module A = Authority.Make (Pclock)
-
-  type t = {ca: A.t}
+  type t = {ca: Authority.t}
 
   let create () =
-    let/? ca = A.create () in
+    let/? ca =
+      Authority.create ()
+        ~cacert_lifetime:(Ptime.Span.of_int_s (Args.cacert_lifetime ()))
+        ~cert_lifetime:(Ptime.Span.of_int_s (Args.cert_lifetime ()))
+        ~adopt_san:(Args.adopt_san ())
+    in
     Ok {ca}
 
   let respond_with_error = function
@@ -72,16 +99,16 @@ module App (Pclock : Mirage_clock.PCLOCK) (S : HTTP) = struct
      | `Der_ca -> ("application/x-x509-ca-cert", X509.Certificate.encode_der)
     in
     let headers = Cohttp.Header.of_list ["Content-Type", content_type] in
-    let body = Cstruct.to_string (encode cert) in
+    let body = encode cert in
     S.respond_string ~status:`OK ~headers ~body ()
 
-  let handle_ca_cert format {ca} = respond_with_cert format (A.own_cert ca)
+  let handle_ca_cert format {ca} =
+    respond_with_cert format (Authority.own_cert ca)
 
   let handle_crl () = assert false
 
   let handle_sign app request body =
     let* body = Cohttp_lwt.Body.to_string body in
-    let body = Cstruct.of_string body in
     let headers = Cohttp.Request.headers request in
     let resp =
       let/? format, decoder =
@@ -94,7 +121,7 @@ module App (Pclock : Mirage_clock.PCLOCK) (S : HTTP) = struct
          | Some s -> bad_request "Cannot handle CSR of type %s." s)
       in
       let/? csr = decoder body |> map_decode_error in
-      let/? cert = A.sign ~csr app.ca |> map_signature_error in
+      let/? cert = Authority.sign ~csr app.ca |> map_signature_error in
       Ok (format, cert)
     in
     (match resp with
@@ -115,7 +142,7 @@ module App (Pclock : Mirage_clock.PCLOCK) (S : HTTP) = struct
   let serve dispatch =
     let callback (_flow, cid) request body =
       let uri = Cohttp.Request.uri request in
-      let cid = Cohttp.Connection.to_string cid in
+      let cid = Cohttp.Connection.to_string cid [@alert "-deprecated"] in
       Log.info (fun f -> f "[%s] serving %s." cid (Uri.to_string uri));
       Lwt.catch (fun () -> dispatch request body)
         (fun exn ->
@@ -127,21 +154,20 @@ module App (Pclock : Mirage_clock.PCLOCK) (S : HTTP) = struct
             ~body:"Internal Server Error\n" ())
     in
     let conn_closed (_, cid) =
-      let cid = Cohttp.Connection.to_string cid in
+      let cid = Cohttp.Connection.to_string cid [@alert "-deprecated"] in
       Log.info (fun f -> f "[%s] closing" cid)
     in
     S.make ~conn_closed ~callback ()
 end
 
-module Make (Pclock : Mirage_clock.PCLOCK) (Http : HTTP) = struct
+module Make (Http : HTTP) = struct
 
-  module Http_app = App (Pclock) (Http)
+  module Http_app = App (Http)
 
-  let start _pclock http =
-    Mirage_crypto_rng_lwt.initialize ();
+  let start http _http_port _adapt_san _cacert_lifetime _cert_lifetime =
     (match Http_app.create () with
      | Ok app ->
-        let http_port = Key_gen.http_port () in
+        let http_port = Args.http_port () in
         let tcp = `TCP http_port in
         Log.info (fun f -> f "listening on %d/TCP" http_port);
         http tcp @@ Http_app.serve (Http_app.dispatcher app)
